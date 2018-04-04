@@ -1,0 +1,266 @@
+#!/usr/local/bin/python3
+# TODO: the proper hashbang doesn't work. not sure why
+# /usr/bin/env python3
+
+# TODO: add "Zabbix" as authorname and a link to zabbix server as author_link.
+# Configure those in config file
+
+# TODO: add some kind of logging
+
+# TODO: Proper comments and documentation
+
+# TODO: Better error handling, add exit codes to exceptions where possible
+
+import argparse
+import configparser
+import json
+import urllib.parse
+import urllib.request
+import urllib.error
+from os import path
+
+def enrich_message(subject, body):
+    """ Return attachements[] to be added to payload for fancy messages
+
+    Args:
+        subject: typically '{TRIGGER.STATUS}: {TRIGGER.NAME}', but it
+            doesn't matter. This is the text of the payload. If it
+            starts with 'OK:' the message will be marked with a green
+            bar.
+        body: multiline string. None of the fiels are mandatory and
+            the order is not important. '::' is used as a separator.
+            Tags are case insensitive.
+
+            Possible values:
+
+            Item:: {HOST.NAME1} | {ITEM.NAME1} | {ITEM.VALUE1}
+            Item:: {HOST.NAME2} | {ITEM.NAME2} | {ITEM.VALUE2}
+            Item:: {HOST.NAME3} | {ITEM.NAME3} | {ITEM.VALUE3}
+            Item:: {HOST.NAME4} | {ITEM.NAME4} | {ITEM.VALUE4}
+            Item:: {HOST.NAME5} | {ITEM.NAME5} | {ITEM.VALUE5}
+            Item:: {HOST.NAME6} | {ITEM.NAME6} | {ITEM.VALUE6}
+            Item:: {HOST.NAME7} | {ITEM.NAME7} | {ITEM.VALUE7}
+            Item:: {HOST.NAME8} | {ITEM.NAME8} | {ITEM.VALUE8}
+            Item:: {HOST.NAME9} | {ITEM.NAME9} | {ITEM.VALUE9}
+            Trigger_name:: {TRIGGER.NAME}
+            Trigger_description:: {TRIGGER.DESCRIPTION}
+            Trigger_status:: {TRIGGER.STATUS}
+            Trigger_severity:: {TRIGGER.SEVERITY}
+            Trigger_nseverity:: {TRIGGER.NSEVERITY}
+            Trigger_URL:: {TRIGGER.URL}
+            Event_ID:: {EVENT.ID}
+            Event_age:: {EVENT.AGE}
+            Event_ack:: {EVENT.ACK.STATUS}
+
+            Item: Each item will be added as a field. Items that are
+                all *UNKNOWN* will be ignored.
+            Trigger_name: Used for the title.
+            Trigger_description: Considered a comment, added as pretext.
+                Can be multiline. Comment ends when a '::' marker is
+                found.
+            Trigger_status: {TRIGGER.STATUS} is either OK or PROBLEM,
+                depending on if it's an alert or a recovery message.
+            Trigger_severity:: Added to the title.
+            Trigger_nseverity:: Numeric severity level. Message will have
+                a yellow or red bar depending on this value. Unless it's
+                a recovery message, in which case the bar will be green.
+            Trigger_URL:: Title URL if present
+            Event_ID:: Added as field.
+            Event_age:: How long ago it was triggered. Added as a field.
+            Event_ack:: 'Yes' or 'No', depending on whether the alert
+                was acknowledged or not
+
+    Returns:
+        A dictionary that can be added to the payload attachements[].
+    """
+    attach = dict()
+    attach['fallback'] = subject
+    attach['fields'] = list()
+    nseverity = 0
+    severity = ''
+    trigger_name = ''
+    commenting = False
+    # Scan the body of the alert, line by line. Each line should start with
+    # with a tag, then two colons (::), then the value for that tag.
+    # For example:
+    #   Trigger_severity:: Average
+    # The 'trigger_description' tag can span multiple lines
+    lines = body.split("\n")
+    for full_line in lines:
+        line = full_line.strip()
+        mark = line.find('::')
+        if (mark == -1 or mark == len(line) - 2) and not commenting:
+            # nothing to see here, move along
+            continue
+        if mark == -1 and commenting:
+            # we're probably inside a multi-line description
+            attach['text'] = attach['text'] + "\n" + line
+            continue
+        if mark != -1 and commenting:
+            # description over
+            commenting = False
+        tag = line.lower()[:mark]
+        # Process tags
+        if tag == 'trigger_description':
+            commenting = True # lines up to the next marker are a comment
+            attach['text'] = line[mark+2:].strip()
+        elif tag == 'item':
+            items = line[mark+2:].split('|')
+            items = list(map(str.strip, items)) # strip extra spaces
+            if items[0] == items[1] == items[2] == '*UNKNOWN*':
+                pass
+            else:
+                field = {
+                        'title': items[1] + ' on ' + items[0] + ":",
+                        'value': items[2]
+                        }
+                attach['fields'].append(field)
+        elif tag == 'trigger_severity':
+            field = {
+                    'title': 'Severity',
+                    'value': line[mark+2:].strip(),
+                    'short': True
+                    }
+            attach['fields'].append(field)
+            # used later to set the title
+            severity = field['value']
+        elif tag == 'trigger_name':
+            # Save to variable for later use along with severity
+            trigger_name = line[mark+2:].strip()
+        elif tag == 'trigger_status':
+            # Save to variable for later use along with severity
+            status = line[mark+2:].strip()
+        elif tag == 'trigger_url':
+            # If there is no title the link is ignored by Slack
+            attach['title_link'] = line[mark+2:].strip()
+        elif tag == 'event_id':
+            field = {
+                    'title': 'Event ID:',
+                    'value': line[mark+2:].strip(),
+                    'short': True
+                    }
+            attach['fields'].append(field)
+        elif tag == 'event_age':
+            field = {
+                    'title': 'Triggered:',
+                    'value': line[mark+2:].strip() + ' ago',
+                    'short': True
+                    }
+            attach['fields'].append(field)
+        elif tag == 'event_ack':
+            field = {
+                    'title': 'Acknowledged:',
+                    'value': line[mark+2:].strip(),
+                    'short': True
+                    }
+            attach['fields'].append(field)
+        elif tag == 'trigger_nseverity':
+            # used to set message color band
+            nseverity = int(line[mark+2:].strip())
+    # set title
+    if trigger_name or severity:
+        if status == 'OK':
+            title_tag = 'RECOVERY'
+        else:
+            title_tag = severity.upper()
+        attach['title'] = '[' + title_tag + '] ' + trigger_name
+    # set message color 
+    if status == 'OK' or subject[0:3] == 'OK:':
+        # must be a recovery message
+        attach['color'] = 'good'
+    elif 1 <= nseverity <= 2:
+        attach['color'] = 'warning'
+    elif 3 <= nseverity <= 5:
+        attach['color'] = 'danger'
+
+    return attach
+
+
+def main():
+    """Post Zabbix alert to Slack
+
+    """
+    optparser = argparse.ArgumentParser(description="Send messages to Slack")
+    optparser.add_argument("subject", type=str, help="Message text. \
+            Should probably be something like 'PROBLEM: Low memory on X'")
+    optparser.add_argument("-b", "--body", type=str, help="Message body. \
+            Should contain a list of items.")
+    optparser.add_argument("-c", "--config", type=str,
+            help="Configuration file")
+    optparser.add_argument("-p", "--profile", type=str,
+            help="Configuration section to load")
+    optparser.add_argument("-w", "--webhook", help="Webhook URL")
+    optparser.add_argument("-t", "--to",
+            help="Message destination. If no qualifier is specified \
+                    (# or @), it's assumed to be a channel (#).")
+    optparser.add_argument("-u", "--username", help="Slack user name")
+    optparser.add_argument("-e", "--emoji", help="Slack emoji")
+    optparser.add_argument("-i", "--icon", help="URL to icon")
+    # optparser.add_argument("-f", "--force", action='store_true')
+    args = optparser.parse_args()
+
+    # get config file
+    scriptdir = path.dirname(path.realpath(__file__))
+    if not args.config:
+        cfg_file = path.join(scriptdir, path.basename(__file__) + ".conf")
+    else:
+        cfg_file = args.config
+    # load configuration from file
+    if path.isfile(cfg_file):
+        cfg = configparser.ConfigParser()
+        cfg['DEFAULT'] = {
+                'webhook_url': '',
+                'send_to': '',
+                'username': 'Zabbix',
+                'emoji': ':loudspeaker:',
+                'icon_url': ''
+                }
+        cfg.read(cfg_file)
+        if args.profile:
+            cfg_section = args.profile
+        else:
+            cfg_section = 'DEFAULT'
+    if not path.isfile(cfg_file) and not args.webhook:
+        print('Configuration file ' + cfg_file + ' not found and \
+                webhook URL not passed as argument.')
+        return 1
+    else:
+        webhook = args.webhook or cfg[cfg_section]['webhook_url']
+        if not webhook:
+            print('Slack Webhook URL not found')
+            return 1
+    channel = args.to or cfg[cfg_section]['send_to']
+    if channel[0] not in ['#', '@']:
+        # Assume it's a channel
+        channel = "#" + channel
+    username = args.username or cfg[cfg_section]['username']
+    emoji = args.emoji or cfg[cfg_section]['emoji']
+    icon = args.icon or cfg[cfg_section]['icon_url']
+
+    # Build Slack message
+    payload = {}
+    payload['text'] = args.subject
+    if channel:
+        payload['channel'] = channel
+    if username:
+        payload['username'] = username
+    if emoji:
+        payload['icon_emoji'] = emoji
+    if icon:
+        payload['icon_url'] = icon
+    if args.body:
+        payload['attachments'] = [
+                enrich_message(args.subject, args.body)
+                ]
+    # POST message to Slack webhook
+    post_data = json.dumps(payload).encode('UTF-8')
+    req = urllib.request.Request(url=webhook, data=post_data)
+    try:
+        response = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        print('Slack returned ' + str(e.getcode()) + ', ' + e.reason)
+    except URLError as e:
+        print('Message post failed because: ' + e.reason)
+
+if __name__ == "__main__":
+    main()
